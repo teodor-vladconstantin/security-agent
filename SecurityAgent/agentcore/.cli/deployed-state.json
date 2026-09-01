@@ -1,0 +1,17 @@
+{
+  "targets": {
+    "default": {
+      "resources": {
+        "runtimes": {
+          "SecurityAgent": {
+            "runtimeId": "SecurityAgent_SecurityAgent-pxP7SRE0di",
+            "runtimeArn": "arn:aws:bedrock-agentcore:us-west-2:064188274873:runtime/SecurityAgent_SecurityAgent-pxP7SRE0di",
+            "roleArn": "arn:aws:iam::064188274873:role/AgentCore-SecurityAgent-d-ApplicationAgentSecurityA-V5S8Vr2mU5za"
+          }
+        },
+        "stackName": "AgentCore-SecurityAgent-default",
+        "deployHash": "a94b465d306aef2d"
+      }
+    }
+  }
+}
