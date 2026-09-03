@@ -16,6 +16,8 @@ dependencies = [
     "mcp ~= 1.24.0",
     "strands-agents >= 1.15.0",
     "pip-audit",
+    "semgrep",
+    "pip-licenses",
 ]
 
 [tool.hatch.build.targets.wheel]

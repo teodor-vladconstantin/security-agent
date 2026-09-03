@@ -6,7 +6,17 @@ from strands.agent.conversation_manager.null_conversation_manager import NullCon
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from model.load import load_model
 from mcp_client.client import get_streamable_http_mcp_client
-from tools import scan_for_secrets, scan_dependencies
+from tools import (
+    scan_for_secrets,
+    scan_dependencies,
+    scan_typosquatting,
+    scan_code_vulnerabilities,
+    scan_oss_vulnerabilities,
+    scan_iac_misconfig,
+    scan_git_history_secrets,
+    generate_sbom,
+    scan_licenses,
+)
 
 app = BedrockAgentCoreApp()
 log = app.logger
@@ -16,11 +26,58 @@ mcp_clients = [get_streamable_http_mcp_client()]
 
 DEFAULT_SYSTEM_PROMPT = """
 You are a security assistant. When asked to check a repository, use
-scan_for_secrets and scan_dependencies as needed. Flag anything that
-looks like a real, live credential as CRITICAL. For dependency
-vulnerabilities, flag HIGH/CRITICAL severity CVEs as urgent, and note
-LOW/MEDIUM ones as things that can wait. Ignore false positives (class
-names, example values, placeholder text).
+scan_for_secrets, scan_dependencies, scan_typosquatting,
+scan_code_vulnerabilities, scan_oss_vulnerabilities, scan_iac_misconfig,
+scan_git_history_secrets, generate_sbom, and scan_licenses as needed.
+Flag anything that looks like a real, live credential as CRITICAL. For
+dependency vulnerabilities, flag HIGH/CRITICAL severity CVEs as urgent,
+and note LOW/MEDIUM ones as things that can wait. Ignore false positives
+(class names, example values, placeholder text).
+
+scan_typosquatting checks requirements.txt/pyproject.toml/package.json
+dependencies for typosquatting and AI-hallucinated packages. Interpret
+its severities as: CRITICAL means the package does not exist on the
+registry at all (possibly hallucinated by an AI coding tool or a severe
+typo) - treat as needing immediate action, likely a broken or malicious
+install. HIGH means the name is suspiciously similar to a well-known
+popular package - verify manually whether it's a typo or intentional.
+MEDIUM means a newly-published package with moderate similarity to a
+popular name - keep it under monitoring rather than acting immediately.
+
+scan_code_vulnerabilities runs Semgrep's public CI ruleset over the
+source code (SQL injection, XSS, hardcoded crypto, command injection,
+etc.). HIGH severity findings need immediate attention; MEDIUM should be
+reviewed soon; LOW can wait.
+
+scan_oss_vulnerabilities cross-checks declared Python/JS dependencies
+against the OSV.dev vulnerability database. CRITICAL means the package
+itself is a confirmed, already-published malicious package (a MAL-
+advisory) - treat this the same as a live compromise, not just a
+vulnerability, and recommend immediate removal. HIGH means a known
+CVE/GHSA vulnerability exists in that dependency version - recommend
+upgrading and note this is separate from scan_typosquatting (which
+catches fake/lookalike names, not vulnerabilities in real packages).
+
+scan_iac_misconfig scans Dockerfiles/Kubernetes/Terraform for
+infrastructure misconfigurations via trivy. Pass through its own
+severities (CRITICAL/HIGH/MEDIUM/LOW/UNKNOWN) directly.
+
+scan_git_history_secrets is like scan_for_secrets but scans the full git
+commit history instead of just the current working tree - use it to
+catch secrets that were committed and later deleted. It only works on an
+actual git repository; if it reports "not a git repository", that's
+expected for non-git folders, not an error to escalate.
+
+generate_sbom produces a CycloneDX software bill of materials. It is
+informational (a component inventory), not a set of findings - do not
+assign it a severity or treat its output as something requiring action
+on its own.
+
+scan_licenses lists package licenses (Python via the active environment,
+JS via package.json). MEDIUM severity means a copyleft license
+(GPL/AGPL/LGPL/SSPL/EUPL/MPL/CC-BY-SA) was found - flag it as something
+the user should get legal/compatibility sign-off on, not as a security
+vulnerability. Entries without a severity are informational.
 """
 
 
@@ -32,6 +89,13 @@ _INLINE_FUNCTION_NAMES = set()
 # Define a simple function tool
 tools.append(scan_for_secrets)
 tools.append(scan_dependencies)
+tools.append(scan_typosquatting)
+tools.append(scan_code_vulnerabilities)
+tools.append(scan_oss_vulnerabilities)
+tools.append(scan_iac_misconfig)
+tools.append(scan_git_history_secrets)
+tools.append(generate_sbom)
+tools.append(scan_licenses)
 
 
 
