@@ -678,6 +678,252 @@ def scan_licenses(repo_path: str = ".") -> str:
     return json.dumps(findings, indent=2)
 
 
+def _dockerfile_base_images(path: str) -> list[str]:
+    """Extract unique pullable image refs from FROM lines in a Dockerfile,
+    excluding references to earlier build stages (FROM <stage-alias>)."""
+    stage_names = set()
+    images = []
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            m = re.match(r"(?i)^FROM\s+(\S+)(?:\s+AS\s+(\S+))?", line.strip())
+            if not m:
+                continue
+            image, alias = m.group(1), m.group(2)
+            if image.lower() != "scratch" and image not in images:
+                images.append(image)
+            if alias:
+                stage_names.add(alias)
+    return [i for i in images if i not in stage_names]
+
+
+@tool
+def scan_container_image(repo_path: str = ".", image_ref: str = "") -> str:
+    """
+    Scans container image(s) for known OS/package CVEs using trivy image.
+    Pulls images directly from their registry - no local Docker build or
+    daemon access required. If image_ref is given, scans that image
+    directly; otherwise extracts base image(s) referenced by FROM lines in
+    repo_path/Dockerfile and scans each of those. Returns a JSON list of
+    findings, each with image, pkg_name, installed_version, fixed_version,
+    vulnerability_id, and severity (CRITICAL/HIGH/MEDIUM/LOW/UNKNOWN, as
+    reported by trivy).
+
+    Args:
+        repo_path: Path to the folder containing a Dockerfile (ignored if
+                    image_ref is given).
+        image_ref: A specific image to scan (e.g. "python:3.12-slim"). If
+                    omitted, Dockerfile FROM lines in repo_path are used.
+    """
+    if image_ref:
+        images = [image_ref]
+    else:
+        dockerfile = os.path.join(repo_path, "Dockerfile")
+        if not os.path.isfile(dockerfile):
+            return "No Dockerfile found and no image_ref given - nothing to scan."
+        images = _dockerfile_base_images(dockerfile)
+        if not images:
+            return "No FROM image references found in Dockerfile."
+
+    findings = []
+    for image in images:
+        # ponytail: --skip-db-update relies on the vuln DB baked into the
+        # image at build time (see Dockerfile) - avoids a slow/network-
+        # dependent DB download on every invocation. Upgrade path: drop the
+        # flag (or rebuild the image regularly) if DB freshness matters more
+        # than latency.
+        result = subprocess.run(
+            ["trivy", "image", "--format", "json", "--quiet", "--skip-db-update", image],
+            capture_output=True,
+            text=True,
+        )
+        try:
+            data = json.loads(result.stdout)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        for entry in data.get("Results") or []:
+            for v in entry.get("Vulnerabilities") or []:
+                findings.append({
+                    "image": image,
+                    "pkg_name": v.get("PkgName"),
+                    "installed_version": v.get("InstalledVersion"),
+                    "fixed_version": v.get("FixedVersion"),
+                    "vulnerability_id": v.get("VulnerabilityID"),
+                    "severity": v.get("Severity", "UNKNOWN"),
+                })
+
+    if not findings:
+        return "No known vulnerabilities found in scanned container image(s)."
+
+    return json.dumps(findings, indent=2)
+
+
+def _has_private_python_index(repo_path: str) -> bool:
+    req_txt = os.path.join(repo_path, "requirements.txt")
+    if os.path.isfile(req_txt):
+        with open(req_txt, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if (line.startswith("--index-url") or line.startswith("--extra-index-url")
+                        or line.startswith("-i ")) and "pypi.org" not in line:
+                    return True
+
+    pyproject = os.path.join(repo_path, "pyproject.toml")
+    if os.path.isfile(pyproject):
+        try:
+            import tomllib
+            with open(pyproject, "rb") as f:
+                data = tomllib.load(f)
+        except ImportError:
+            data = {}
+        if data.get("tool", {}).get("uv", {}).get("index"):
+            return True
+        if data.get("tool", {}).get("poetry", {}).get("source"):
+            return True
+
+    return False
+
+
+def _has_private_npm_registry(repo_path: str) -> bool:
+    npmrc = os.path.join(repo_path, ".npmrc")
+    if os.path.isfile(npmrc):
+        with open(npmrc, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if ("registry=" in line or ":registry=" in line) and "registry.npmjs.org" not in line:
+                    return True
+    return False
+
+
+@tool
+def scan_dependency_confusion(repo_path: str = ".") -> str:
+    """
+    Checks for dependency confusion risk: a repo that configures a private
+    package index/registry (pip --index-url/--extra-index-url, uv/poetry
+    custom index, npm .npmrc registry) is at risk if a declared package
+    name ALSO exists on the corresponding PUBLIC registry - a build that
+    doesn't strictly pin to the private index could silently pull the
+    public (potentially attacker-planted) package instead. Returns a JSON
+    list of findings (severity MEDIUM) for packages that exist publicly
+    while a private index is configured, or a message explaining why the
+    check doesn't apply (no private index configured).
+
+    Args:
+        repo_path: Path to the folder to scan for manifests and index config.
+    """
+    has_private_py = _has_private_python_index(repo_path)
+    has_private_npm = _has_private_npm_registry(repo_path)
+
+    if not has_private_py and not has_private_npm:
+        return "No private package index configured - dependency confusion risk does not apply here."
+
+    packages = []
+    if has_private_py:
+        req_txt = os.path.join(repo_path, "requirements.txt")
+        if os.path.isfile(req_txt):
+            packages.extend((name, "pypi") for name in _parse_requirements_txt(req_txt))
+        pyproject = os.path.join(repo_path, "pyproject.toml")
+        if os.path.isfile(pyproject):
+            packages.extend((name, "pypi") for name in _parse_pyproject_toml(pyproject))
+    if has_private_npm:
+        package_json = os.path.join(repo_path, "package.json")
+        if os.path.isfile(package_json):
+            packages.extend((name, "npm") for name in _parse_package_json(package_json))
+
+    if not packages:
+        return "Private index configured but no matching manifests found to check."
+
+    seen = set()
+    unique_packages = []
+    for name, eco in packages:
+        key = (name.lower(), eco)
+        if key not in seen:
+            seen.add(key)
+            unique_packages.append((name, eco))
+
+    findings = []
+    for name, eco in unique_packages:
+        url = (
+            f"https://pypi.org/pypi/{name}/json"
+            if eco == "pypi"
+            else f"https://registry.npmjs.org/{name}"
+        )
+        status, _ = _fetch_registry_json(url)
+        time.sleep(0.3)  # ponytail: same sequential rate limit as scan_typosquatting
+        if status == "ok":
+            findings.append({
+                "package_name": name,
+                "ecosystem": eco,
+                "severity": "MEDIUM",
+                "reason": "Pachet gasit atat pe registry-ul public cat si aveti index privat configurat - risc de dependency confusion daca prioritatea index-urilor nu e stricta.",
+                "suggested_action": f"Verifica ca instalarea lui '{name}' foloseste indexul privat (index/pin explicit), nu doar --extra-index-url care poate prefera public.",
+            })
+
+    if not findings:
+        return "Private index configured, but none of the declared packages also exist on the public registry."
+
+    return json.dumps(findings, indent=2)
+
+
+_REPORT_TOOLS = [
+    ("secrets", "scan_for_secrets"),
+    ("git_history_secrets", "scan_git_history_secrets"),
+    ("dependencies", "scan_dependencies"),
+    ("oss_vulnerabilities", "scan_oss_vulnerabilities"),
+    ("typosquatting", "scan_typosquatting"),
+    ("dependency_confusion", "scan_dependency_confusion"),
+    ("code_vulnerabilities", "scan_code_vulnerabilities"),
+    ("iac_misconfig", "scan_iac_misconfig"),
+    ("container_image", "scan_container_image"),
+    ("licenses", "scan_licenses"),
+]
+
+
+@tool
+def generate_security_report(repo_path: str = ".") -> str:
+    """
+    Runs every other scan_* tool in this module against repo_path in one
+    pass (sequentially - this is the slow, "scan everything" option) and
+    returns a single consolidated JSON report: per-tool result
+    (finding_count plus either the parsed findings or the raw message) and
+    an overall "_summary" with total findings by severity across all tools
+    whose findings carry a severity field. Use this instead of calling each
+    tool individually when asked for a full/complete audit. Does not
+    include generate_sbom (informational inventory, not findings).
+
+    Args:
+        repo_path: Path to the folder to scan.
+    """
+    report = {}
+    severity_totals = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+
+    for key, func_name in _REPORT_TOOLS:
+        func = globals()[func_name]
+        try:
+            result = func(repo_path)
+        except Exception as e:  # noqa: BLE001 - one tool failing shouldn't break the report
+            report[key] = {"finding_count": 0, "error": str(e)}
+            continue
+
+        try:
+            data = json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            report[key] = {"finding_count": 0, "message": result}
+            continue
+
+        if isinstance(data, list):
+            for f in data:
+                if isinstance(f, dict):
+                    sev = f.get("severity") or f.get("Severity")
+                    if sev in severity_totals:
+                        severity_totals[sev] += 1
+            report[key] = {"finding_count": len(data), "findings": data}
+        else:
+            report[key] = {"finding_count": 0, "raw": data}
+
+    report["_summary"] = severity_totals
+    return json.dumps(report, indent=2)
+
+
 if __name__ == "__main__":
     # ponytail: minimal self-check, no network calls
     assert _parse_requirements_txt.__name__  # sanity the module loaded
@@ -721,5 +967,27 @@ if __name__ == "__main__":
 
     with tempfile.TemporaryDirectory() as d:
         assert scan_git_history_secrets(d) == "Not a git repository (no .git directory) - history cannot be scanned."
+
+    with tempfile.TemporaryDirectory() as d:
+        dockerfile = os.path.join(d, "Dockerfile")
+        with open(dockerfile, "w") as f:
+            f.write("FROM python:3.12-slim AS builder\nRUN pip install foo\nFROM builder\nCOPY . .\n")
+        assert _dockerfile_base_images(dockerfile) == ["python:3.12-slim"]
+
+        req = os.path.join(d, "requirements.txt")
+        with open(req, "w") as f:
+            f.write("--extra-index-url https://pkgs.internal.example.com/simple\nrequests==2.0\n")
+        assert _has_private_python_index(d) is True
+        assert scan_dependency_confusion(os.path.join(d, "nope")) == "No private package index configured - dependency confusion risk does not apply here."
+
+    with tempfile.TemporaryDirectory() as d:
+        assert _has_private_python_index(d) is False
+        assert _has_private_npm_registry(d) is False
+
+    with tempfile.TemporaryDirectory() as d:
+        npmrc = os.path.join(d, ".npmrc")
+        with open(npmrc, "w") as f:
+            f.write("@myorg:registry=https://npm.internal.example.com/\n")
+        assert _has_private_npm_registry(d) is True
 
     print("tools.py self-check OK")

@@ -25,6 +25,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl git \
 # real `git` binary for history scanning (scan_git_history_secrets), it
 # does not use an embedded git implementation.
 
+# scan_container_image needs trivy's vulnerability DB (unlike `trivy
+# config`/`trivy fs`, which don't). Pre-fetch it into a fixed, world-
+# readable cache dir at build time and scan with --skip-db-update at
+# runtime, instead of re-downloading it on every cold start.
+ENV TRIVY_CACHE_DIR=/opt/trivy-cache
+RUN mkdir -p "$TRIVY_CACHE_DIR" \
+    && trivy image --download-db-only \
+    && chmod -R a+rX "$TRIVY_CACHE_DIR"
+
 RUN pip install --no-cache-dir uv
 
 ARG UV_DEFAULT_INDEX
@@ -50,6 +59,11 @@ RUN useradd -m -u 1000 bedrock_agentcore
 # report for the first time) - a silent permission-denied that tools
 # ignore because subprocess.run's exit code isn't checked.
 RUN chown bedrock_agentcore:bedrock_agentcore /app
+
+# TRIVY_CACHE_DIR was pre-populated as root above; trivy also needs to
+# create a writable "fanal" subdirectory there at scan time (separate from
+# the pre-fetched vuln DB) - a+rX alone isn't enough, it needs ownership.
+RUN chown -R bedrock_agentcore:bedrock_agentcore /opt/trivy-cache
 
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
