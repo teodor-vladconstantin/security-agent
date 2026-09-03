@@ -6,6 +6,7 @@ import time
 import difflib
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime, timezone
 from strands import tool
 
@@ -204,12 +205,23 @@ def _parse_package_json(path: str) -> list[str]:
     return names
 
 
+def _pypi_json_url(name: str) -> str:
+    return f"https://pypi.org/pypi/{urllib.parse.quote(name, safe='')}/json"
+
+
+def _npm_json_url(name: str) -> str:
+    return f"https://registry.npmjs.org/{urllib.parse.quote(name, safe='')}"
+
+
 def _fetch_registry_json(url: str, timeout: float = 10.0):
     """Fetch a registry URL. Returns ("ok", data), ("not_found", None), or
     ("error", None) for anything inconclusive (network issues, non-404 errors)."""
     req = urllib.request.Request(url, headers={"User-Agent": "SecurityAgent-typosquat-scanner/1.0"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        # url is always host+path built by _pypi_json_url/_npm_json_url, which
+        # urllib.parse.quote()-encode the untrusted package-name segment -
+        # scheme/host are fixed literals, not attacker-controlled.
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
             return "ok", json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         if e.code == 404:
@@ -262,7 +274,9 @@ def _fetch_json_post(url: str, payload: dict, timeout: float = 15.0):
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        # url's only caller passes a fixed string literal (OSV.dev's
+        # querybatch endpoint) - nothing attacker-controlled reaches it.
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
             return "ok", json.loads(resp.read().decode())
     except (urllib.error.URLError, OSError, ValueError):
         return "error", None
@@ -345,11 +359,7 @@ def scan_typosquatting(repo_path: str = ".") -> str:
     findings = []
     for name, eco in unique_packages:
         popular = POPULAR_PYPI if eco == "pypi" else POPULAR_NPM
-        url = (
-            f"https://pypi.org/pypi/{name}/json"
-            if eco == "pypi"
-            else f"https://registry.npmjs.org/{name}"
-        )
+        url = _pypi_json_url(name) if eco == "pypi" else _npm_json_url(name)
         status, data = _fetch_registry_json(url)
         time.sleep(0.3)  # ponytail: simple sequential rate limit, no concurrency to throttle
 
@@ -655,7 +665,7 @@ def scan_licenses(repo_path: str = ".") -> str:
     package_json = os.path.join(repo_path, "package.json")
     if os.path.isfile(package_json):
         for name in _parse_package_json(package_json):
-            status, data = _fetch_registry_json(f"https://registry.npmjs.org/{name}")
+            status, data = _fetch_registry_json(_npm_json_url(name))
             time.sleep(0.3)  # ponytail: same sequential rate limit as scan_typosquatting
             license_val = _extract_npm_license(data) if status == "ok" and data else None
             entries.append({
@@ -842,11 +852,7 @@ def scan_dependency_confusion(repo_path: str = ".") -> str:
 
     findings = []
     for name, eco in unique_packages:
-        url = (
-            f"https://pypi.org/pypi/{name}/json"
-            if eco == "pypi"
-            else f"https://registry.npmjs.org/{name}"
-        )
+        url = _pypi_json_url(name) if eco == "pypi" else _npm_json_url(name)
         status, _ = _fetch_registry_json(url)
         time.sleep(0.3)  # ponytail: same sequential rate limit as scan_typosquatting
         if status == "ok":
@@ -964,6 +970,14 @@ if __name__ == "__main__":
 
     assert _SEMGREP_SEVERITY_MAP["ERROR"] == "HIGH"
     assert _OSV_ECOSYSTEM["pypi"] == "PyPI" and _OSV_ECOSYSTEM["npm"] == "npm"
+
+    # A crafted package name (from an untrusted manifest) must not be able
+    # to inject a new path segment / header via the registry URL.
+    assert _pypi_json_url("requests") == "https://pypi.org/pypi/requests/json"
+    assert _pypi_json_url("../evil") == "https://pypi.org/pypi/..%2Fevil/json"
+    assert "\r\n" not in _pypi_json_url("evil\r\nX-Injected: 1")
+    assert _npm_json_url("@scope/pkg") == "https://registry.npmjs.org/%40scope%2Fpkg"
+    assert "\r\n" not in _npm_json_url("evil\r\nX-Injected: 1")
 
     with tempfile.TemporaryDirectory() as d:
         assert scan_git_history_secrets(d) == "Not a git repository (no .git directory) - history cannot be scanned."
