@@ -2,12 +2,15 @@ import subprocess
 import json
 import os
 import re
+import shutil
+import tempfile
 import time
 import difflib
 import urllib.request
 import urllib.error
 import urllib.parse
 from datetime import datetime, timezone
+from pathlib import Path
 from strands import tool
 
 @tool
@@ -67,6 +70,61 @@ def scan_dependencies(repo_path: str = ".") -> str:
         return "No known vulnerabilities found."
 
     return result.stdout
+
+
+_CLONE_TIMEOUT = 60
+
+
+def _clone_git_repo(url: str, ref: str = "") -> Path:
+    """Shallow-clone a git repo (and optionally a specific ref/SHA) to a
+    fresh temp dir. Mirrors the shallow-clone pattern in
+    skills/fetcher.py._fetch_git_skill, minus skill-specific caching/
+    credential handling - every PR review is a one-off, so this always
+    clones fresh rather than caching by source hash."""
+    dest = Path(tempfile.mkdtemp(prefix="secagent-clone-"))
+    try:
+        subprocess.run(
+            ["git", "clone", "--depth", "1", url, str(dest)],
+            check=True, timeout=_CLONE_TIMEOUT, capture_output=True, text=True,
+        )
+        if ref:
+            subprocess.run(
+                ["git", "fetch", "--depth", "1", "origin", ref],
+                check=True, timeout=_CLONE_TIMEOUT, capture_output=True, text=True, cwd=str(dest),
+            )
+            subprocess.run(
+                ["git", "checkout", "FETCH_HEAD"],
+                check=True, timeout=_CLONE_TIMEOUT, capture_output=True, text=True, cwd=str(dest),
+            )
+    except Exception:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+    return dest
+
+
+@tool
+def clone_repo(url: str, ref: str = "") -> str:
+    """
+    Shallow-clones a public git repository (optionally at a specific branch,
+    tag, or commit SHA) to a local temp directory and returns that path.
+    Use this first when asked to review a pull request, branch, or external
+    repository URL - pass the returned path as repo_path to any of the
+    scan_* tools or generate_security_report afterward. Public repos only
+    (no credential handling).
+
+    Args:
+        url: HTTPS clone URL of the repository (e.g. a PR's head repo URL).
+        ref: Optional branch name, tag, or commit SHA to check out after
+              cloning (e.g. a PR's head SHA). Defaults to the repo's
+              default branch.
+    """
+    try:
+        path = _clone_git_repo(url, ref)
+    except subprocess.TimeoutExpired:
+        return f"Error: cloning '{url}' timed out after {_CLONE_TIMEOUT}s."
+    except subprocess.CalledProcessError as e:
+        return f"Error: failed to clone '{url}' (ref={ref or 'default'}): {e.stderr.strip()}"
+    return str(path)
 
 
 # Top ~200 most popular PyPI packages, used as a reference set for
@@ -1079,5 +1137,17 @@ if __name__ == "__main__":
         with open(npmrc, "w") as f:
             f.write("@myorg:registry=https://npm.internal.example.com/\n")
         assert _has_private_npm_registry(d) is True
+
+    cloned = clone_repo("https://github.com/octocat/Hello-World.git")
+    assert os.path.isdir(cloned), cloned
+    assert os.path.isfile(os.path.join(cloned, "README")), os.listdir(cloned)
+    shutil.rmtree(cloned, ignore_errors=True)
+
+    cloned_ref = clone_repo("https://github.com/octocat/Hello-World.git", ref="test")
+    assert os.path.isdir(cloned_ref), cloned_ref
+    shutil.rmtree(cloned_ref, ignore_errors=True)
+
+    bad = clone_repo("https://github.com/octocat/definitely-not-a-real-repo-xyz123.git")
+    assert bad.startswith("Error:"), bad
 
     print("tools.py self-check OK")
