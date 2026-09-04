@@ -8,6 +8,12 @@
 
 **Tech Stack:** Python (Strands `@tool`, subprocess + git CLI — no new Python dependencies), GitHub Actions (`@aws/agentcore` npm CLI, `aws-actions/configure-aws-credentials`, `gh pr comment`), AWS IAM (scoped user + inline policy).
 
+## Status (as of 2026-09-04)
+
+- Tasks 1-6: **done**, each independently verified (tool self-check passes, `main.py` imports cleanly, deploy succeeded with the same runtime ARN, IAM policy confirmed via a real `agentcore invoke` call that got past `AccessDeniedException`, workflow YAML validated). All pushed to `main`.
+- Task 7 (open the real demo PR, confirm a comment appears on the vulnerable one and silence on the clean one): **blocked**, not started. The account's Bedrock quota is stuck at 0 (`ThrottlingException: Too many tokens per day` on every call, even for authorized/entitled models — matches a known "bedrock-mantle endpoint" issue reported on AWS re:Post). An AWS Support "service limit increase" case was opened for this; this account only has Basic support, so there's no guaranteed response SLA. **Resume Task 7 as soon as a plain `agentcore invoke --json "say hi"` from `SecurityAgent/` stops returning a `ThrottlingException`.**
+- Also still open, not part of this plan: the hackathon demo video (its centerpiece scene *is* Task 7, so it's blocked on the same thing), the Devpost text description, and the empty GitHub repo description field.
+
 ## Global Constraints
 
 - Reuse the existing shallow-clone pattern from `SecurityAgent/app/SecurityAgent/skills/fetcher.py` (`git clone --depth 1`, temp dir, cleanup on failure) rather than inventing a new one.
