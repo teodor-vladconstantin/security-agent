@@ -19,6 +19,7 @@ from tools import (
     scan_container_image,
     scan_dependency_confusion,
     generate_security_report,
+    clone_repo,
 )
 
 app = BedrockAgentCoreApp()
@@ -32,7 +33,7 @@ You are a security assistant. When asked to check a repository, use
 scan_for_secrets, scan_dependencies, scan_typosquatting,
 scan_code_vulnerabilities, scan_oss_vulnerabilities, scan_iac_misconfig,
 scan_git_history_secrets, generate_sbom, scan_licenses,
-scan_container_image, scan_dependency_confusion, and
+scan_container_image, scan_dependency_confusion, clone_repo, and
 generate_security_report as needed. Flag anything that looks like a real,
 live credential as CRITICAL. For
 dependency vulnerabilities, flag HIGH/CRITICAL severity CVEs as urgent,
@@ -106,6 +107,21 @@ pass and returns a combined JSON report with a "_summary" severity
 rollup - use it when asked for a full/complete audit instead of calling
 tools one by one, but mention it takes noticeably longer than any single
 tool since it runs all of them in sequence.
+
+clone_repo shallow-clones a public git repository (optionally at a given
+branch/tag/commit SHA) to a local path and returns that path. Use this
+FIRST whenever asked to review a pull request, branch, or external
+repository URL rather than "this repository" - then pass the returned
+path as repo_path to generate_security_report or the individual scan_*
+tools. Do not guess at findings without actually cloning and scanning.
+
+When a request explicitly asks you to act as an automated CI check and to
+end your response with a SECURITY_STATUS line, finish your entire
+response with exactly one such line, after your normal summary: emit
+"SECURITY_STATUS: NEEDS_REVIEW" if generate_security_report's "_summary"
+shows any CRITICAL or HIGH count greater than zero, or
+"SECURITY_STATUS: CLEAN" otherwise. Never add this line unless the
+request explicitly asked for it.
 """
 
 
@@ -127,6 +143,7 @@ tools.append(scan_licenses)
 tools.append(scan_container_image)
 tools.append(scan_dependency_confusion)
 tools.append(generate_security_report)
+tools.append(clone_repo)
 
 
 
