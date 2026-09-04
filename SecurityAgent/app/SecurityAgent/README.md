@@ -24,7 +24,7 @@ invoking the agent.
 | Variable | Required | Description |
 | --- | --- | --- |
 | `MODEL_PROVIDER` | No | `bedrock` (default) or `gemini`. Bedrock uses the runtime's IAM role - no API key needed. |
-| `BEDROCK_MODEL_ID` | No | Bedrock model/inference-profile ID. Defaults to `us.anthropic.claude-sonnet-5`. |
+| `BEDROCK_MODEL_ID` | No | Bedrock model/inference-profile ID. Defaults to `us.anthropic.claude-sonnet-4-5-20250929-v1:0`. |
 | `GEMINI_API_KEY` | Only if `MODEL_PROVIDER=gemini` | Gemini API key (local) or Identity provider name (deployed) |
 | `LOCAL_DEV` | No | Set to `1` to use `.env.local` instead of AgentCore Identity (Gemini path only) |
 

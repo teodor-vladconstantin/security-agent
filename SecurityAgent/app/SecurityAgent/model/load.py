@@ -6,7 +6,7 @@ from bedrock_agentcore.identity.auth import requires_api_key
 
 IDENTITY_PROVIDER_NAME = "gemini-api-key"
 IDENTITY_ENV_VAR = "GEMINI_API_KEY"
-BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-5")
+BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
 
 
 @requires_api_key(provider_name=IDENTITY_PROVIDER_NAME)
