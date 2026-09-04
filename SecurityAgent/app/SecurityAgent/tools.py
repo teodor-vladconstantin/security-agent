@@ -160,22 +160,27 @@ POPULAR_NPM = {
 }
 
 
-def _parse_requirements_txt(path: str) -> list[str]:
-    """Extract bare package names from a requirements.txt file."""
-    names = []
+def _parse_requirements_txt(path: str) -> list[tuple[str, str | None]]:
+    """Extract (name, exact_version) pairs from a requirements.txt file.
+    version is None unless the line pins an exact version with '=='."""
+    entries = []
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#") or line.startswith("-"):
                 continue
             name = re.split(r"[<>=!~\[; ]", line)[0].strip()
-            if name:
-                names.append(name)
-    return names
+            if not name:
+                continue
+            m = re.search(r"==\s*([A-Za-z0-9_.\-]+)", line)
+            entries.append((name, m.group(1) if m else None))
+    return entries
 
 
-def _parse_pyproject_toml(path: str) -> list[str]:
-    """Extract dependency package names from PEP 621 or Poetry pyproject.toml."""
+def _parse_pyproject_toml(path: str) -> list[tuple[str, str | None]]:
+    """Extract (name, exact_version) pairs from PEP 621 or Poetry
+    pyproject.toml. version is None unless the dependency is pinned to a
+    single exact version (== for PEP 621, a bare version for Poetry)."""
     try:
         import tomllib
     except ImportError:
@@ -183,26 +188,64 @@ def _parse_pyproject_toml(path: str) -> list[str]:
     with open(path, "rb") as f:
         data = tomllib.load(f)
 
-    specs = list(data.get("project", {}).get("dependencies", []))
+    entries = []
+
+    for spec in data.get("project", {}).get("dependencies", []):
+        if not isinstance(spec, str):
+            continue
+        name = re.split(r"[<>=!~\[; ]", spec)[0].strip()
+        if not name:
+            continue
+        m = re.search(r"==\s*([A-Za-z0-9_.\-]+)", spec)
+        entries.append((name, m.group(1) if m else None))
+
     poetry_deps = data.get("tool", {}).get("poetry", {}).get("dependencies", {})
-    specs.extend(name for name in poetry_deps if name.lower() != "python")
+    for name, spec in poetry_deps.items():
+        if name.lower() == "python":
+            continue
+        version = None
+        if isinstance(spec, str) and re.fullmatch(r"[A-Za-z0-9_.\-]+", spec.strip()):
+            version = spec.strip()  # bare version string = exact pin in Poetry
+        entries.append((name, version))
 
-    names = []
-    for spec in specs:
-        if isinstance(spec, str):
-            name = re.split(r"[<>=!~\[; ]", spec)[0].strip()
-            if name:
-                names.append(name)
-    return names
+    return entries
 
 
-def _parse_package_json(path: str) -> list[str]:
-    """Extract dependency + devDependency package names from package.json."""
+def _parse_package_json(path: str) -> list[tuple[str, str | None]]:
+    """Extract (name, exact_version) pairs from package.json dependencies +
+    devDependencies. version is None unless it's a bare exact semver (no
+    range operators like ^, ~, >=, x, *)."""
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         data = json.load(f)
-    names = list(data.get("dependencies", {}).keys())
-    names.extend(data.get("devDependencies", {}).keys())
-    return names
+    deps = {}
+    deps.update(data.get("dependencies", {}) or {})
+    deps.update(data.get("devDependencies", {}) or {})
+
+    entries = []
+    for name, spec in deps.items():
+        version = None
+        if isinstance(spec, str) and re.fullmatch(r"\d+\.\d+\.\d+(-[A-Za-z0-9.\-]+)?", spec.strip()):
+            version = spec.strip()
+        entries.append((name, version))
+    return entries
+
+
+def _parse_uv_lock(path: str) -> dict[str, str]:
+    """Map lowercased package name -> exact resolved version from a uv.lock
+    file. More authoritative than pyproject.toml (which usually declares a
+    range, not the version actually installed)."""
+    try:
+        import tomllib
+    except ImportError:
+        return {}
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    versions = {}
+    for pkg in data.get("package", []):
+        name, version = pkg.get("name"), pkg.get("version")
+        if name and version:
+            versions[name.lower()] = version
+    return versions
 
 
 def _pypi_json_url(name: str) -> str:
@@ -333,17 +376,17 @@ def scan_typosquatting(repo_path: str = ".") -> str:
     req_txt = os.path.join(repo_path, "requirements.txt")
     if os.path.isfile(req_txt):
         found_manifest = True
-        packages.extend((name, "pypi") for name in _parse_requirements_txt(req_txt))
+        packages.extend((name, "pypi") for name, _ in _parse_requirements_txt(req_txt))
 
     pyproject = os.path.join(repo_path, "pyproject.toml")
     if os.path.isfile(pyproject):
         found_manifest = True
-        packages.extend((name, "pypi") for name in _parse_pyproject_toml(pyproject))
+        packages.extend((name, "pypi") for name, _ in _parse_pyproject_toml(pyproject))
 
     package_json = os.path.join(repo_path, "package.json")
     if os.path.isfile(package_json):
         found_manifest = True
-        packages.extend((name, "npm") for name in _parse_package_json(package_json))
+        packages.extend((name, "npm") for name, _ in _parse_package_json(package_json))
 
     if not found_manifest:
         return "No requirements.txt, pyproject.toml, or package.json found."
@@ -455,9 +498,15 @@ def scan_oss_vulnerabilities(repo_path: str = ".") -> str:
     Scans Python and JavaScript dependency manifests (requirements.txt,
     pyproject.toml, package.json) against the OSV.dev vulnerability database
     for known CVEs/GHSAs and for packages already confirmed as malicious
-    (MAL- advisories). Returns a JSON list of findings, each with
-    package_name, ecosystem, vulnerability_id, severity (CRITICAL for
-    known-malicious packages, HIGH for known CVEs/GHSAs), and
+    (MAL- advisories). When a manifest pins an exact version, the query is
+    scoped to that version; a uv.lock next to pyproject.toml overrides that
+    with the actually-resolved version (more authoritative than a range
+    like ">=1.0,<2.0"). Unpinned/range dependencies with no uv.lock entry
+    fall back to matching any vulnerability ever reported for that package
+    name, which can over-report if the actual resolved version is already
+    patched. Returns a JSON list of
+    findings, each with package_name, ecosystem, vulnerability_id, severity
+    (CRITICAL for known-malicious packages, HIGH for known CVEs/GHSAs), and
     suggested_action.
 
     Args:
@@ -467,37 +516,48 @@ def scan_oss_vulnerabilities(repo_path: str = ".") -> str:
 
     req_txt = os.path.join(repo_path, "requirements.txt")
     if os.path.isfile(req_txt):
-        packages.extend((name, "pypi") for name in _parse_requirements_txt(req_txt))
+        packages.extend((name, "pypi", version) for name, version in _parse_requirements_txt(req_txt))
 
     pyproject = os.path.join(repo_path, "pyproject.toml")
     if os.path.isfile(pyproject):
-        packages.extend((name, "pypi") for name in _parse_pyproject_toml(pyproject))
+        packages.extend((name, "pypi", version) for name, version in _parse_pyproject_toml(pyproject))
 
     package_json = os.path.join(repo_path, "package.json")
     if os.path.isfile(package_json):
-        packages.extend((name, "npm") for name in _parse_package_json(package_json))
+        packages.extend((name, "npm", version) for name, version in _parse_package_json(package_json))
 
     if not packages:
         return "No requirements.txt, pyproject.toml, or package.json found."
 
+    uv_lock = os.path.join(repo_path, "uv.lock")
+    locked_versions = _parse_uv_lock(uv_lock) if os.path.isfile(uv_lock) else {}
+
     seen = set()
     unique_packages = []
-    for name, eco in packages:
+    for name, eco, version in packages:
         key = (name.lower(), eco)
         if key not in seen:
             seen.add(key)
-            unique_packages.append((name, eco))
+            # uv.lock reflects the actually-resolved version, which is more
+            # authoritative than a pyproject.toml range (e.g. ">=1.0,<2.0").
+            version = locked_versions.get(name.lower(), version) if eco == "pypi" else version
+            unique_packages.append((name, eco, version))
 
-    queries = [
-        {"package": {"name": name, "ecosystem": _OSV_ECOSYSTEM[eco]}}
-        for name, eco in unique_packages
-    ]
+    # Scope the query to the exact declared version when we know it, so
+    # results reflect what's actually pinned rather than every vuln ever
+    # reported for that package name across all versions.
+    queries = []
+    for name, eco, version in unique_packages:
+        query = {"package": {"name": name, "ecosystem": _OSV_ECOSYSTEM[eco]}}
+        if version:
+            query["version"] = version
+        queries.append(query)
     status, data = _fetch_json_post("https://api.osv.dev/v1/querybatch", {"queries": queries})
     if status != "ok":
         return "OSV.dev lookup failed (network issue) - no findings reported."
 
     findings = []
-    for (name, eco), result in zip(unique_packages, data.get("results", [])):
+    for (name, eco, version), result in zip(unique_packages, data.get("results", [])):
         for vuln in result.get("vulns", []):
             vuln_id = vuln.get("id", "")
             if vuln_id.startswith("MAL-"):
@@ -664,7 +724,7 @@ def scan_licenses(repo_path: str = ".") -> str:
 
     package_json = os.path.join(repo_path, "package.json")
     if os.path.isfile(package_json):
-        for name in _parse_package_json(package_json):
+        for name, _ in _parse_package_json(package_json):
             status, data = _fetch_registry_json(_npm_json_url(name))
             time.sleep(0.3)  # ponytail: same sequential rate limit as scan_typosquatting
             license_val = _extract_npm_license(data) if status == "ok" and data else None
@@ -830,14 +890,14 @@ def scan_dependency_confusion(repo_path: str = ".") -> str:
     if has_private_py:
         req_txt = os.path.join(repo_path, "requirements.txt")
         if os.path.isfile(req_txt):
-            packages.extend((name, "pypi") for name in _parse_requirements_txt(req_txt))
+            packages.extend((name, "pypi") for name, _ in _parse_requirements_txt(req_txt))
         pyproject = os.path.join(repo_path, "pyproject.toml")
         if os.path.isfile(pyproject):
-            packages.extend((name, "pypi") for name in _parse_pyproject_toml(pyproject))
+            packages.extend((name, "pypi") for name, _ in _parse_pyproject_toml(pyproject))
     if has_private_npm:
         package_json = os.path.join(repo_path, "package.json")
         if os.path.isfile(package_json):
-            packages.extend((name, "npm") for name in _parse_package_json(package_json))
+            packages.extend((name, "npm") for name, _ in _parse_package_json(package_json))
 
     if not packages:
         return "Private index configured but no matching manifests found to check."
@@ -940,12 +1000,28 @@ if __name__ == "__main__":
         req = os.path.join(d, "requirements.txt")
         with open(req, "w") as f:
             f.write("# comment\nreqeusts==1.0.0\nnumpy>=1.20\n-e .\n")
-        assert _parse_requirements_txt(req) == ["reqeusts", "numpy"]
+        assert _parse_requirements_txt(req) == [("reqeusts", "1.0.0"), ("numpy", None)]
 
         pkg = os.path.join(d, "package.json")
         with open(pkg, "w") as f:
-            json.dump({"dependencies": {"lodahs": "^4.0.0"}, "devDependencies": {"jest": "^29.0.0"}}, f)
-        assert _parse_package_json(pkg) == ["lodahs", "jest"]
+            json.dump({"dependencies": {"lodahs": "^4.0.0", "express": "4.18.2"}, "devDependencies": {"jest": "^29.0.0"}}, f)
+        assert _parse_package_json(pkg) == [("lodahs", None), ("express", "4.18.2"), ("jest", None)]
+
+        pyproj = os.path.join(d, "pyproject.toml")
+        with open(pyproj, "w") as f:
+            f.write(
+                '[project]\ndependencies = ["reqeusts==1.0.0", "numpy>=1.20"]\n'
+                '[tool.poetry.dependencies]\npython = "^3.10"\nrequests = "2.31.0"\nflask = "^3.0.0"\n'
+            )
+        pep621 = [e for e in _parse_pyproject_toml(pyproj) if e[0] != "requests" and e[0] != "flask"]
+        assert pep621 == [("reqeusts", "1.0.0"), ("numpy", None)]
+        assert ("requests", "2.31.0") in _parse_pyproject_toml(pyproj)  # poetry bare version = exact pin
+        assert ("flask", None) in _parse_pyproject_toml(pyproj)  # poetry ^range - not an exact pin
+
+        lock = os.path.join(d, "uv.lock")
+        with open(lock, "w") as f:
+            f.write('[[package]]\nname = "mcp"\nversion = "1.29.1"\n')
+        assert _parse_uv_lock(lock) == {"mcp": "1.29.1"}
 
     best_name, ratio = _closest_popular_match("reqeusts", POPULAR_PYPI)
     assert best_name == "requests" and ratio > 0.85, (best_name, ratio)
