@@ -543,6 +543,26 @@ AWS_ACCESS_KEY_ID="<AccessKeyId>" AWS_SECRET_ACCESS_KEY="<SecretAccessKey>" AWS_
 
 Expected: no `AccessDeniedException`. If you get one naming a missing action/resource (e.g. it wants a `runtime-endpoint` sub-resource too), broaden the policy's `Resource` to `arn:aws:bedrock-agentcore:us-west-2:064188274873:runtime/SecurityAgent_SecurityAgent-pxP7SRE0di*` (trailing wildcard) and re-run `put-user-policy`, then retry this step. A `ThrottlingException` here is fine — it proves the IAM policy authorized the call; only an `AccessDeniedException` means the policy is wrong.
 
+**Verified this session:** the bare `aws bedrock-agentcore invoke-agent-runtime` CLI call is not a reliable sanity check on this account — it hung/timed out client-side (`Read timeout on endpoint URL: "None"`) even after IAM was correctly scoped, independent of authorization. Use the actual `agentcore invoke --json "say hi"` CLI (run from `SecurityAgent/`, with the same temporary env vars) instead — it's what Task 6 actually uses. It also surfaced a second required action: the `agentcore` CLI sends an `X-Amzn-Bedrock-AgentCore-Runtime-User-Id` header, which AWS requires both `bedrock-agentcore:InvokeAgentRuntime` **and** `bedrock-agentcore:InvokeAgentRuntimeForUser` to be granted for. The policy in Step 2 above should list both actions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "bedrock-agentcore:InvokeAgentRuntime",
+        "bedrock-agentcore:InvokeAgentRuntimeForUser"
+      ],
+      "Resource": "arn:aws:bedrock-agentcore:us-west-2:064188274873:runtime/SecurityAgent_SecurityAgent-pxP7SRE0di*"
+    }
+  ]
+}
+```
+
+A `ThrottlingException` in the `agentcore invoke` response (rather than an `"error"` field naming `AccessDeniedException`) confirms the policy is correct.
+
 ---
 
 ### Task 6: Add the GitHub Actions workflow
