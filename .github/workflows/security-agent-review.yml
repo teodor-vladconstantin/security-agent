@@ -1,0 +1,51 @@
+name: SecurityAgent PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (agentcore project config)
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install agentcore CLI
+        run: npm install -g @aws/agentcore@0.28.1
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.SECURITY_AGENT_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.SECURITY_AGENT_AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-2
+
+      - name: Invoke SecurityAgent
+        id: invoke
+        working-directory: SecurityAgent
+        run: |
+          PROMPT="A pull request was opened against ${{ github.repository }}. Clone ${{ github.event.pull_request.head.repo.clone_url }} at ref ${{ github.event.pull_request.head.sha }} and perform a full security review as an automated CI check. End your response with a SECURITY_STATUS line as instructed in your system prompt."
+          agentcore invoke --json "$PROMPT" > /tmp/agent_output.json
+          cat /tmp/agent_output.json
+          jq -r '.response' /tmp/agent_output.json > /tmp/agent_response.txt
+          if grep -q "SECURITY_STATUS: NEEDS_REVIEW" /tmp/agent_response.txt; then
+            echo "needs_review=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_review=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment on PR if review needed
+        if: steps.invoke.outputs.needs_review == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/agent_response.txt
