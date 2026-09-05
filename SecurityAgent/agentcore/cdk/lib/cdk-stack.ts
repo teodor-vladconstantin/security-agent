@@ -125,6 +125,14 @@ export class AgentCoreStack extends Stack {
     }
     this.application = new AgentCoreApplication(this, 'Application', appProps as any);
 
+    // Bedrock is hitting an account-wide "too many tokens per day" throttle
+    // (AWS Support case open, Basic support tier, no SLA). Switch the runtime
+    // to the already-supported Gemini path (see model/load.py) until that
+    // clears, so Task 7's end-to-end PR demo isn't blocked on it.
+    for (const env of this.application.environments.values()) {
+      env.runtime.addEnvironmentVariable('MODEL_PROVIDER', 'gemini');
+    }
+
     // Create AgentCoreMcp if there are gateways configured
     if (mcpSpec?.agentCoreGateways && mcpSpec.agentCoreGateways.length > 0) {
       new AgentCoreMcp(this, 'Mcp', {
